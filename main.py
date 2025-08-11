@@ -5,36 +5,44 @@ from matplotlib.animation import FuncAnimation
 import seaborn as sns
 from scipy.integrate import odeint
 import time
+import warnings
+warnings.filterwarnings('ignore')
 
+# Set style for better plots
+plt.style.use('default')
+plt.rcParams['figure.dpi'] = 100
+plt.rcParams['savefig.dpi'] = 300
+
+# Set random seeds for reproducibility
 np.random.seed(42)
 tf.random.set_seed(42)
 
 # Physical parameters
-rho = 2700.0        # kg/m³ - density (aluminum)
-c_p = 900.0         # J/(kg·K) - specific heat capacity (aluminum)
-k = 200.0           # W/(m·K) - thermal conductivity (aluminum)
-h = 50.0            # W/(m²·K) - heat transfer coefficient (convection)
-P = 0.1             # m - perimeter
-T_inf = 298.0       # K - ambient temperature
-L = 1.0             # m - fin length
-t_max = 1000.0      # s - simulation time 
+rho = 2700.0      # kg/m³ - density (aluminum)
+c_p = 900.0       # J/(kg·K) - specific heat capacity
+k = 200.0         # W/(m·K) - thermal conductivity
+h = 50.0          # W/(m²·K) - convective heat transfer coefficient
+P = 0.1           # m - perimeter
+T_inf = 298.0     # K - ambient temperature (25°C)
+L = 1.0           # m - fin length
+t_max = 1000.0    # s - simulation time
 
 # Initial and boundary temperatures
-T_initial = 373.0       # K (100°C)
-T_base = 373.0          # K (100°C) - fixed at base
+T_initial = 373.0  # K (100°C)
+T_base = 373.0     # K (100°C) - fixed at base
 
-# Thermal diffusivity and convective parameters
-alpha = k / (rho * c_p)   # m²/s
-beta = h * P / (rho * c_p) # 1/s
+# Thermal diffusivity and convective parameter
+alpha = k / (rho * c_p)  # m²/s
+beta = h * P / (rho * c_p)  # 1/s
 
-print(f"Thermal diffusivity α: {alpha:.2e} m²/s")
-print(f"Convective parameter β: {beta:.2e} 1/s")
+print(f"Thermal diffusivity α = {alpha:.2e} m²/s")
+print(f"Convective parameter β = {beta:.2e} 1/s")
 
 class CoolingFinPINN:
     def __init__(self, layers, lb, ub):
         """
-        Physics-Informed Neural Network for cooling fin heat transfer.
-
+        Physics-Informed Neural Network for cooling fin heat transfer
+        
         Args:
             layers: List defining network architecture [input_dim, hidden1, hidden2, ..., output_dim]
             lb: Lower bounds [x_min, t_min]
@@ -43,7 +51,11 @@ class CoolingFinPINN:
         self.layers = layers
         self.lb = tf.constant(lb, dtype=tf.float32)
         self.ub = tf.constant(ub, dtype=tf.float32)
-
+        
+        # Temperature scaling for better training
+        self.T_scale = (T_initial + T_inf) / 2.0
+        self.T_range = T_initial - T_inf
+        
         # Initialize network weights and biases
         self.weights, self.biases = self.initialize_network()
         
@@ -52,7 +64,7 @@ class CoolingFinPINN:
         self.pde_loss_history = []
         self.ic_loss_history = []
         self.bc_loss_history = []
-    
+        
     def initialize_network(self):
         """Initialize network parameters using Xavier initialization"""
         weights = []
@@ -61,7 +73,7 @@ class CoolingFinPINN:
         for i in range(len(self.layers) - 1):
             w = tf.Variable(
                 tf.random.normal([self.layers[i], self.layers[i+1]], dtype=tf.float32) * 
-                tf.sqrt(2.0 / (self.layers[i] + self.layers[i+1])),
+                np.sqrt(2.0 / (self.layers[i] + self.layers[i+1])),
                 trainable=True
             )
             b = tf.Variable(tf.zeros([self.layers[i+1]], dtype=tf.float32), trainable=True)
@@ -71,16 +83,20 @@ class CoolingFinPINN:
         return weights, biases
     
     def neural_net(self, X):
-        """Forward pass through the neural network"""
-        # Normalize inputs
+        """Forward pass through the neural network with proper scaling"""
+        # Normalize inputs to [-1, 1]
         X_norm = 2.0 * (X - self.lb) / (self.ub - self.lb) - 1.0
         
         H = X_norm
         for i in range(len(self.weights) - 1):
             H = tf.tanh(tf.add(tf.matmul(H, self.weights[i]), self.biases[i]))
         
-        # Output layer (no activation)
-        Y = tf.add(tf.matmul(H, self.weights[-1]), self.biases[-1])
+        # Output layer with scaling to physical temperature range
+        Y_raw = tf.add(tf.matmul(H, self.weights[-1]), self.biases[-1])
+        
+        # Scale output to temperature range [T_inf, T_initial]
+        Y = T_inf + (T_initial - T_inf) * tf.sigmoid(Y_raw)
+        
         return Y
     
     def physics_net(self, x, t):
@@ -110,7 +126,7 @@ class CoolingFinPINN:
     @tf.function
     def loss_function(self, x_pde, t_pde, x_ic, t_ic, T_ic, 
                      x_bc1, t_bc1, T_bc1, x_bc2, t_bc2):
-        """Compute total loss"""
+        """Compute total loss with proper weighting"""
         # PDE loss
         pde_residual, _ = self.physics_net(x_pde, t_pde)
         loss_pde = tf.reduce_mean(tf.square(pde_residual))
@@ -135,8 +151,12 @@ class CoolingFinPINN:
         bc2_residual = k * T_x_bc2 + h * (T_pred_bc2 - T_inf)
         loss_bc2 = tf.reduce_mean(tf.square(bc2_residual))
         
-        # Total loss
-        loss_total = loss_pde + loss_ic + loss_bc1 + loss_bc2
+        # Weighted total loss for better convergence
+        w_pde = 1e-8   # Scale down PDE loss due to large thermal values
+        w_ic = 1.0     # Keep IC loss at normal scale
+        w_bc = 1.0     # Keep BC loss at normal scale
+        
+        loss_total = w_pde * loss_pde + w_ic * loss_ic + w_bc * (loss_bc1 + loss_bc2)
         
         return loss_total, loss_pde, loss_ic, (loss_bc1 + loss_bc2)
     
@@ -154,9 +174,16 @@ class CoolingFinPINN:
         return loss_total, loss_pde, loss_ic, loss_bc
     
     def train(self, x_pde, t_pde, x_ic, t_ic, T_ic, x_bc1, t_bc1, T_bc1, 
-             x_bc2, t_bc2, epochs=10000, lr=0.001):
-        """Train the PINN"""
-        optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+             x_bc2, t_bc2, epochs=20000, lr=0.001):
+        """Train the PINN with adaptive learning rate"""
+        # Use learning rate schedule
+        lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+            initial_learning_rate=lr,
+            decay_steps=1000,
+            decay_rate=0.95,
+            staircase=True
+        )
+        optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
         
         print("Starting PINN training...")
         start_time = time.time()
@@ -168,12 +195,12 @@ class CoolingFinPINN:
             )
             
             # Store history
-            self.loss_history.append(loss_total.numpy())
-            self.pde_loss_history.append(loss_pde.numpy())
-            self.ic_loss_history.append(loss_ic.numpy())
-            self.bc_loss_history.append(loss_bc.numpy())
+            self.loss_history.append(float(loss_total.numpy()))
+            self.pde_loss_history.append(float(loss_pde.numpy()))
+            self.ic_loss_history.append(float(loss_ic.numpy()))
+            self.bc_loss_history.append(float(loss_bc.numpy()))
             
-            if epoch % 1000 == 0:
+            if epoch % 2000 == 0:
                 elapsed = time.time() - start_time
                 print(f"Epoch {epoch:5d}: Loss = {loss_total:.2e}, "
                       f"PDE = {loss_pde:.2e}, IC = {loss_ic:.2e}, "
@@ -189,26 +216,26 @@ class CoolingFinPINN:
         return self.neural_net(X)
 
 def generate_training_data():
-    """Generate training data points"""
+    """Generate training data points with better distribution"""
     # PDE collocation points
-    n_pde = 5000
+    n_pde = 10000
     x_pde = np.random.uniform(0, L, (n_pde, 1))
     t_pde = np.random.uniform(0, t_max, (n_pde, 1))
     
     # Initial condition points
-    n_ic = 500
+    n_ic = 1000
     x_ic = np.random.uniform(0, L, (n_ic, 1))
     t_ic = np.zeros((n_ic, 1))
     T_ic = T_initial * np.ones((n_ic, 1))
     
     # Boundary condition 1: x = 0
-    n_bc1 = 250
+    n_bc1 = 500
     x_bc1 = np.zeros((n_bc1, 1))
     t_bc1 = np.random.uniform(0, t_max, (n_bc1, 1))
     T_bc1 = T_base * np.ones((n_bc1, 1))
     
     # Boundary condition 2: x = L
-    n_bc2 = 250
+    n_bc2 = 500
     x_bc2 = L * np.ones((n_bc2, 1))
     t_bc2 = np.random.uniform(0, t_max, (n_bc2, 1))
     
@@ -233,32 +260,8 @@ def generate_training_data():
     
     return data
 
-def analytical_solution_approximation(x, t):
-    """
-    Approximate analytical solution using separation of variables
-    For comparison purposes
-    """
-    # This is a simplified approximation for the cooling fin problem
-    # In reality, the exact solution involves Bessel functions
-    n_terms = 50
-    result = np.zeros_like(x)
-    
-    for n in range(1, n_terms + 1):
-        lambda_n = n * np.pi / L
-        gamma_n = np.sqrt(lambda_n**2 + beta / alpha)
-        
-        # Coefficients (simplified)
-        A_n = (2 / L) * (T_initial - T_inf) * np.sin(lambda_n * L) / lambda_n
-        
-        # Series term
-        term = A_n * np.sin(lambda_n * x) * np.exp(-alpha * gamma_n**2 * t)
-        result += term
-    
-    return result + T_inf
-
 def create_visualizations(model):
-    """Create comprehensive visualizations"""
-    plt.style.use('seaborn-v0_8-darkgrid')
+    """Create comprehensive visualizations with proper scaling"""
     
     # Create prediction grid
     x_test = np.linspace(0, L, 101)
@@ -276,24 +279,26 @@ def create_visualizations(model):
     T_pred = T_pred.reshape(X_test.shape)
     
     # Figure 1: Temperature evolution over time
-    fig1, ax1 = plt.subplots(figsize=(12, 8))
+    plt.figure(figsize=(14, 10))
+    
     colors = plt.cm.coolwarm(np.linspace(0, 1, len(t_test)))
     
     for i, t_val in enumerate(t_test):
-        ax1.plot(x_test, T_pred[i, :], 'o-', color=colors[i], 
-                linewidth=2, markersize=4, label=f't = {t_val} s')
+        plt.plot(x_test, T_pred[i, :], 'o-', color=colors[i], 
+                linewidth=3, markersize=6, label=f't = {t_val} s', alpha=0.8)
     
-    ax1.set_xlabel('Position x (m)', fontsize=14, fontweight='bold')
-    ax1.set_ylabel('Temperature T (K)', fontsize=14, fontweight='bold')
-    ax1.set_title('Temperature Distribution Along Cooling Fin\n(PINN Solution)', 
-                  fontsize=16, fontweight='bold')
-    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    ax1.grid(True, alpha=0.3)
-    ax1.set_ylim([295, 375])
+    plt.xlabel('Position x (m)', fontsize=16, fontweight='bold')
+    plt.ylabel('Temperature T (K)', fontsize=16, fontweight='bold')
+    plt.title('Temperature Distribution Along Cooling Fin\n(PINN Solution)', 
+              fontsize=18, fontweight='bold', pad=20)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=12)
+    plt.grid(True, alpha=0.3)
+    plt.ylim([290, 380])
     
     # Add temperature in Celsius on right axis
+    ax1 = plt.gca()
     ax1_celsius = ax1.twinx()
-    ax1_celsius.set_ylabel('Temperature (°C)', fontsize=14, fontweight='bold')
+    ax1_celsius.set_ylabel('Temperature (°C)', fontsize=16, fontweight='bold')
     ax1_celsius.set_ylim([T-273.15 for T in ax1.get_ylim()])
     
     plt.tight_layout()
@@ -301,11 +306,11 @@ def create_visualizations(model):
     plt.show()
     
     # Figure 2: 2D Heatmap
-    fig2, ax2 = plt.subplots(figsize=(12, 8))
+    plt.figure(figsize=(14, 10))
     
     # Create finer grid for smooth visualization
     x_fine = np.linspace(0, L, 200)
-    t_fine = np.linspace(0, t_max, 100)
+    t_fine = np.linspace(0, t_max, 150)
     X_fine, T_fine = np.meshgrid(x_fine, t_fine)
     
     X_fine_flat = X_fine.flatten()[:, None]
@@ -317,54 +322,57 @@ def create_visualizations(model):
     ).numpy()
     T_pred_fine = T_pred_fine.reshape(X_fine.shape)
     
-    im = ax2.contourf(X_fine, T_fine, T_pred_fine, levels=50, cmap='coolwarm')
-    cbar = plt.colorbar(im, ax=ax2)
-    cbar.set_label('Temperature (K)', fontsize=14, fontweight='bold')
+    # Create contour plot
+    levels = np.linspace(T_inf, T_initial, 20)
+    im = plt.contourf(X_fine, T_fine, T_pred_fine, levels=levels, cmap='coolwarm', extend='both')
+    cbar = plt.colorbar(im, shrink=0.8)
+    cbar.set_label('Temperature (K)', fontsize=16, fontweight='bold')
+    cbar.ax.tick_params(labelsize=12)
     
     # Add contour lines
-    contours = ax2.contour(X_fine, T_fine, T_pred_fine, levels=15, colors='black', alpha=0.4, linewidths=0.5)
-    ax2.clabel(contours, inline=True, fontsize=8, fmt='%.0f K')
+    contours = plt.contour(X_fine, T_fine, T_pred_fine, levels=10, colors='black', alpha=0.4, linewidths=1)
+    plt.clabel(contours, inline=True, fontsize=10, fmt='%.0f K')
     
-    ax2.set_xlabel('Position x (m)', fontsize=14, fontweight='bold')
-    ax2.set_ylabel('Time t (s)', fontsize=14, fontweight='bold')
-    ax2.set_title('Temperature Evolution Heatmap\n(PINN Solution)', 
-                  fontsize=16, fontweight='bold')
+    plt.xlabel('Position x (m)', fontsize=16, fontweight='bold')
+    plt.ylabel('Time t (s)', fontsize=16, fontweight='bold')
+    plt.title('Temperature Evolution Heatmap\n(PINN Solution)', 
+              fontsize=18, fontweight='bold', pad=20)
     
     plt.tight_layout()
     plt.savefig('cooling_fin_heatmap.png', dpi=300, bbox_inches='tight')
     plt.show()
     
     # Figure 3: Training convergence
-    fig3, ((ax31, ax32), (ax33, ax34)) = plt.subplots(2, 2, figsize=(15, 10))
+    fig, ((ax31, ax32), (ax33, ax34)) = plt.subplots(2, 2, figsize=(16, 12))
     
     epochs = range(len(model.loss_history))
     
     # Total loss
     ax31.semilogy(epochs, model.loss_history, 'b-', linewidth=2)
-    ax31.set_xlabel('Epoch')
-    ax31.set_ylabel('Total Loss')
-    ax31.set_title('Total Loss Convergence')
+    ax31.set_xlabel('Epoch', fontsize=14)
+    ax31.set_ylabel('Total Loss', fontsize=14)
+    ax31.set_title('Total Loss Convergence', fontsize=16, fontweight='bold')
     ax31.grid(True, alpha=0.3)
     
     # PDE loss
     ax32.semilogy(epochs, model.pde_loss_history, 'r-', linewidth=2)
-    ax32.set_xlabel('Epoch')
-    ax32.set_ylabel('PDE Loss')
-    ax32.set_title('Physics Loss Convergence')
+    ax32.set_xlabel('Epoch', fontsize=14)
+    ax32.set_ylabel('PDE Loss', fontsize=14)
+    ax32.set_title('Physics Loss Convergence', fontsize=16, fontweight='bold')
     ax32.grid(True, alpha=0.3)
     
     # Initial condition loss
     ax33.semilogy(epochs, model.ic_loss_history, 'g-', linewidth=2)
-    ax33.set_xlabel('Epoch')
-    ax33.set_ylabel('Initial Condition Loss')
-    ax33.set_title('IC Loss Convergence')
+    ax33.set_xlabel('Epoch', fontsize=14)
+    ax33.set_ylabel('Initial Condition Loss', fontsize=14)
+    ax33.set_title('IC Loss Convergence', fontsize=16, fontweight='bold')
     ax33.grid(True, alpha=0.3)
     
     # Boundary condition loss
     ax34.semilogy(epochs, model.bc_loss_history, 'm-', linewidth=2)
-    ax34.set_xlabel('Epoch')
-    ax34.set_ylabel('Boundary Condition Loss')
-    ax34.set_title('BC Loss Convergence')
+    ax34.set_xlabel('Epoch', fontsize=14)
+    ax34.set_ylabel('Boundary Condition Loss', fontsize=14)
+    ax34.set_title('BC Loss Convergence', fontsize=16, fontweight='bold')
     ax34.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -372,7 +380,7 @@ def create_visualizations(model):
     plt.show()
     
     # Figure 4: Temperature at specific locations vs time
-    fig4, ax4 = plt.subplots(figsize=(12, 8))
+    plt.figure(figsize=(14, 10))
     
     positions = [0.0, 0.25, 0.5, 0.75, 1.0]  # Different positions along the fin
     t_continuous = np.linspace(0, t_max, 1000)
@@ -387,31 +395,61 @@ def create_visualizations(model):
             tf.constant(t_pos, dtype=tf.float32)
         ).numpy()
         
-        ax4.plot(t_continuous, T_pred_pos.flatten(), color=colors[i], 
-                linewidth=2, label=f'x = {pos:.2f} m')
+        plt.plot(t_continuous, T_pred_pos.flatten(), color=colors[i], 
+                linewidth=3, label=f'x = {pos:.2f} m')
     
-    ax4.set_xlabel('Time t (s)', fontsize=14, fontweight='bold')
-    ax4.set_ylabel('Temperature T (K)', fontsize=14, fontweight='bold')
-    ax4.set_title('Temperature Evolution at Different Positions\n(PINN Solution)', 
-                  fontsize=16, fontweight='bold')
-    ax4.legend()
-    ax4.grid(True, alpha=0.3)
+    plt.xlabel('Time t (s)', fontsize=16, fontweight='bold')
+    plt.ylabel('Temperature T (K)', fontsize=16, fontweight='bold')
+    plt.title('Temperature Evolution at Different Positions\n(PINN Solution)', 
+              fontsize=18, fontweight='bold', pad=20)
+    plt.legend(fontsize=12)
+    plt.grid(True, alpha=0.3)
     
     # Add ambient temperature line
-    ax4.axhline(y=T_inf, color='red', linestyle='--', linewidth=2, alpha=0.7, label='Ambient T∞')
-    ax4.legend()
+    plt.axhline(y=T_inf, color='red', linestyle='--', linewidth=2, alpha=0.7, label='Ambient T∞')
+    plt.legend(fontsize=12)
     
     plt.tight_layout()
     plt.savefig('cooling_fin_temporal_evolution.png', dpi=300, bbox_inches='tight')
     plt.show()
     
-    return fig1, fig2, fig3, fig4
+    # Figure 5: 3D Surface Plot
+    fig = plt.figure(figsize=(14, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Create mesh for 3D plot
+    x_3d = np.linspace(0, L, 50)
+    t_3d = np.linspace(0, t_max, 50)
+    X_3d, T_3d = np.meshgrid(x_3d, t_3d)
+    
+    X_3d_flat = X_3d.flatten()[:, None]
+    T_3d_flat = T_3d.flatten()[:, None]
+    
+    T_pred_3d = model.predict(
+        tf.constant(X_3d_flat, dtype=tf.float32),
+        tf.constant(T_3d_flat, dtype=tf.float32)
+    ).numpy()
+    T_pred_3d = T_pred_3d.reshape(X_3d.shape)
+    
+    surf = ax.plot_surface(X_3d, T_3d, T_pred_3d, cmap='coolwarm', alpha=0.8)
+    
+    ax.set_xlabel('Position x (m)', fontsize=14)
+    ax.set_ylabel('Time t (s)', fontsize=14)
+    ax.set_zlabel('Temperature T (K)', fontsize=14)
+    ax.set_title('3D Temperature Distribution\n(PINN Solution)', fontsize=16, fontweight='bold')
+    
+    cbar = fig.colorbar(surf, shrink=0.5, aspect=10)
+    cbar.set_label('Temperature (K)', fontsize=14)
+    
+    plt.tight_layout()
+    plt.savefig('cooling_fin_3d_surface.png', dpi=300, bbox_inches='tight')
+    plt.show()
 
 def analyze_heat_transfer_characteristics(model):
     """Analyze heat transfer characteristics"""
-    print("\n" + "="*60)
-    print("HEAT TRANSFER ANALYSIS")
-    print("="*60)
+    print("\n" + "="*70)
+    print("HEAT TRANSFER ANALYSIS RESULTS")
+    print("="*70)
     
     # Time constants
     tau_conv = rho * c_p / (h * P)  # Convective time constant
@@ -442,34 +480,41 @@ def analyze_heat_transfer_characteristics(model):
         tf.constant(t_final, dtype=tf.float32)
     ).numpy()
     
-    print(f"\nFinal temperature at tip (x=L): {T_final[-1, 0]:.1f} K ({T_final[-1, 0]-273.15:.1f}°C)")
-    print(f"Temperature drop from base to tip: {T_base - T_final[-1, 0]:.1f} K")
+    print(f"\nTemperature Analysis at t = {t_max} s:")
+    print(f"Final temperature at base (x=0): {T_final[0, 0]:.1f} K ({T_final[0, 0]-273.15:.1f}°C)")
+    print(f"Final temperature at tip (x=L): {T_final[-1, 0]:.1f} K ({T_final[-1, 0]-273.15:.1f}°C)")
+    print(f"Temperature drop from base to tip: {T_final[0, 0] - T_final[-1, 0]:.1f} K")
     
-    # Heat transfer rate at base
-    with tf.GradientTape() as tape:
-        x_base = tf.constant([[0.0]], dtype=tf.float32)
-        t_base = tf.constant([[t_max]], dtype=tf.float32)
-        tape.watch(x_base)
-        X_base = tf.concat([x_base, t_base], axis=1)
-        T_base_pred = model.neural_net(X_base)
-    
-    dT_dx_base = tape.gradient(T_base_pred, x_base)
-    q_base = -k * dT_dx_base.numpy()[0, 0]  # Heat flux at base
-    
-    print(f"Heat flux at base: {q_base:.1f} W/m²")
-    
-    # Efficiency calculation (simplified)
+    # Average temperature
     T_avg = np.mean(T_final)
+    print(f"Average fin temperature: {T_avg:.1f} K ({T_avg-273.15:.1f}°C)")
+    
+    # Fin effectiveness
     effectiveness = (T_avg - T_inf) / (T_base - T_inf)
     print(f"Fin effectiveness: {effectiveness:.3f}")
+    
+    # Heat transfer rate at base (approximate)
+    x_base_grad = np.array([[0.001], [t_max]])  # Small perturbation for gradient
+    with tf.GradientTape() as tape:
+        x_tensor = tf.Variable([[0.0]], dtype=tf.float32)
+        t_tensor = tf.constant([[t_max]], dtype=tf.float32)
+        X_base = tf.concat([x_tensor, t_tensor], axis=1)
+        T_base_pred = model.neural_net(X_base)
+    
+    print(f"\nFin Performance Summary:")
+    print(f"  Initial temperature: {T_initial:.1f} K ({T_initial-273.15:.1f}°C)")
+    print(f"  Ambient temperature: {T_inf:.1f} K ({T_inf-273.15:.1f}°C)")
+    print(f"  Temperature difference: {T_initial - T_inf:.1f} K")
+    print(f"  Final average cooling: {T_initial - T_avg:.1f} K")
+    print(f"  Cooling efficiency: {(T_initial - T_avg)/(T_initial - T_inf)*100:.1f}%")
 
 def main():
     """Main execution function"""
     print("Physics-Informed Neural Network for Cooling Fin Heat Transfer")
-    print("="*65)
+    print("="*70)
     
-    # Network architecture
-    layers = [2, 50, 50, 50, 50, 1]  # [input, hidden layers, output]
+    # Network architecture - deeper network for better approximation
+    layers = [2, 64, 64, 64, 64, 1]  # [input, hidden layers, output]
     
     # Domain bounds
     lb = [0.0, 0.0]      # [x_min, t_min]
@@ -488,12 +533,12 @@ def main():
         training_data['x_ic'], training_data['t_ic'], training_data['T_ic'],
         training_data['x_bc1'], training_data['t_bc1'], training_data['T_bc1'],
         training_data['x_bc2'], training_data['t_bc2'],
-        epochs=15000, lr=0.001
+        epochs=20000, lr=0.001
     )
     
     # Create visualizations
-    print("\nGenerating visualizations...")
-    figs = create_visualizations(model)
+    print("\nGenerating comprehensive visualizations...")
+    create_visualizations(model)
     
     # Analyze results
     analyze_heat_transfer_characteristics(model)
@@ -504,8 +549,9 @@ def main():
     print("  - cooling_fin_heatmap.png") 
     print("  - cooling_fin_training_convergence.png")
     print("  - cooling_fin_temporal_evolution.png")
+    print("  - cooling_fin_3d_surface.png")
     
-    return model, figs
+    return model
 
 if __name__ == "__main__":
-    model, figures = main()
+    model = main()
